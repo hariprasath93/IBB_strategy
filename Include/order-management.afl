@@ -1,0 +1,14 @@
+file = "C:\\Program Files\\AmiBroker\\Formulas\\IBB Strategy\\trades.txt"; 
+
+function storeOrder(orderID,tradeType, ticker, qty, time){
+	fp = fopen(file,"w",True);
+	if(fp){
+		_TRACE("Saving Orders");
+		tradeFormat = StrFormat("%f,%s,%s,%f\n",orderID,tradeType,ticker,qty);
+		fputs(tradeFormat,fp);
+		fclose(fp);
+	}else 
+	_TRACE("Error Openning order files");
+	
+	return 1;
+}	

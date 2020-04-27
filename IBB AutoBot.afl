@@ -1,0 +1,245 @@
+#include <algotrader-util.afl>
+#include <order-management.afl>
+
+/**************************************** 
+	Charts and Visualization
+*****************************************/
+_SECTION_BEGIN("Price");
+
+SetChartOptions(0,chartShowArrows|chartShowDates);
+_N(Title = StrFormat("{{NAME}} - {{INTERVAL}} {{DATE}} Open %g, Hi %g, Lo %g, Close %g (%.1f%%) {{VALUES}}", O, H, L, C, SelectedValue( ROC( C, 1 ) ) ));
+Plot( C, "Close", ParamColor("Color", colorDefault ), styleCandle|styleThick | ParamStyle("Style") | GetPriceStyle() ); 
+
+_SECTION_END();
+
+/** Plotting day separator **/
+newDay = Day()!=Ref(Day(),-1); 
+Plot(newDay,"",colorlightGrey,styleHistogram|styleDots|styleNoLabel|styleOwnScale);
+
+/*********************************************
+	System Parameters
+**********************************************/
+_SECTION_BEGIN("System Parameters");
+
+SetOption("ReverseSignalForcesExit", False);
+SetOption("EveryBarNullCheck",True);
+MaxOpenPosition = Optimize("Open Position",10,1,20,1);
+SetOption("MaxOpenPositions", MaxOpenPosition);
+TradingHours_Begin = 091500; //ParamTime("Trading Hour Begin","091500",0);
+TradingHours_End = 150000; //ParamTime("Trading Hours End","150000",0);
+ExitTime = ParamTime("Exit Time","151500",0);
+
+_SECTION_END();
+
+/**********************************************
+	IBB calculation and plot 
+	
+We might use different time frame to scan the stocks and enter into a trade. But the inside bar
+has to be calculated only at 30 mins period. So we are setting time frame as 30 minutes, calculate
+the IB, and then expland the array to work in lower time frames. This is very important for the 
+strategy to work.
+***********************************************/
+_SECTION_BEGIN("IBB Plot");
+Interval_30 = 6*in5Minute;
+
+TimeFrameSet(Interval_30);
+	insidebar = L > Ref(L,-1) AND High < Ref(L,-1) + Ref((H-L)/2,-1);
+	ibHigh = ValueWhen(insidebar,H,1);
+	ibLow = ValueWhen(insidebar,L,1);
+	ibday = IIf(DateNum() == ValueWhen(insidebar,DateNum(),1),1,Null)
+		AND TimeNum() >=ValueWhen(insidebar,TimeNum(),1) AND TimeNum() < 153000;
+	RiskPerShare = ibHigh - ibLow;
+TimeFrameRestore();
+
+insidebar_E = TimeFrameExpand(insidebar,Interval_30);
+ibHigh_E = TimeFrameExpand(ibHigh,Interval_30);
+ibLow_E = TimeFrameExpand(ibLow,Interval_30);
+RiskPerShare_E = TimeFrameExpand(RiskPerShare,Interval_30);
+ibday_E = TimeFrameExpand(ibday,Interval_30);
+
+/** Apart from the IB plot we are also plotting the +/- 1R level **/
+Plot(IIf(ibday_E,ibHigh_E,Null),"High",colorGreen,styleLine|styleThick,0,0,0,0);
+Plot(IIf(ibday_E,ibLow_E,Null),"Low",colorRed,styleLine|styleThick,0,0,0,0);
+Plot(IIf(ibday_E,ibHigh_E + RiskPerShare_E,Null),"High",colorGreen,styleLine|styleDashed|styleThick,0,0,0,0);
+Plot(IIf(ibday_E,ibLow_E - RiskPerShare_E,Null),"Low",colorRed,styleLine|styleDashed|styleThick,0,0,0,0);
+
+_SECTION_END();
+
+/****************************************************
+	Buy and Sell signal generation and Plot
+*****************************************************/
+_SECTION_BEGIN("IBB Strategy");
+
+Trading_Hours = TimeNum() >= TradingHours_Begin AND TimeNum() <= TradingHours_End;
+ExitTimeCond = TimeNum() >= 151500;
+
+BuySignal = ibday_E AND H > ibHigh_E AND Trading_Hours;
+ShortSignal = ibday_E AND L < ibLow_E AND Trading_Hours;
+onBuy = Buy = BuySignal;
+Sell = ExitTimeCond;
+onShort = Short = ShortSignal;
+Cover = ExitTimeCond;
+BuyPrice = ibHigh_E;
+ShortPrice = ibLow_E;
+/* Remove excess signals so that, new entries are not triggered as and when the condition 
+becomes true */
+Buy = ExRem(Buy, Sell);
+Sell = ExRem(Sell, Buy);
+Short = ExRem(Short, Cover);
+Cover = ExRem(Cover, Short);
+
+/** Calculating the trailing stop loss **/
+priceAtBuy = ValueWhen( Buy, BuyPrice );
+priceAtShort = ValueWhen(Short, ShortPrice);
+
+tslOptimizer = 0;//Optimize("tslOptimizer",1,-1,1,0.25);
+inLongTrade = Flip(Buy,Sell);
+inShortTrade = Flip(Short,Cover);
+
+//tslLong = ibLow_E;
+calcLong = IIf(Int((C - priceAtBuy)/RiskPerShare_E) < 1,tslOptimizer,Int((C - priceAtBuy)/RiskPerShare_E));
+howFarLong = priceAtBuy + (calcLong - 1)*RiskPerShare_E;
+tslLong = calcTslLong = HighestSince(Buy,howFarLong,0);
+//tslLong = IIf(inLongTrade,Ref(calcTslLong,-1),Null);
+//VarSet("tslLong-"+Name(),LastValue(tslLong,True));
+
+//tslShort = ibHigh_E;
+calcShort = IIf(Int((priceAtShort - C)/RiskPerShare_E) < 1,tslOptimizer,Int((priceAtShort - C)/RiskPerShare_E));
+howFarShort = priceAtShort - (calcShort - 1)*RiskPerShare_E;
+tslShort = calcTslShort = LowestSince(Short,howFarShort,0);
+//tslShort = IIf(inShortTrade,Ref(calcTslShort,0),Null);
+
+
+
+Cover = H > Ref(tslShort,-1) OR TimeNum() >= 151500;
+Cover = ExRem(Cover,Short);
+CoverPrice = IIf(TimeNum()>=151500,C,Ref(tslShort,-1));
+
+Sell = L < Ref(tslLong,-1) OR TimeNum() >= 151500;
+Sell = ExRem(Sell,Buy);
+SellPrice = IIf(TimeNum()>=151500,C,Ref(tslLong,-1));
+
+
+BuyCount = SellCount = onBuy1 = onShort1 = 0;
+for(i = 0; i < BarCount ; i++){
+	
+	if(newDay[i]) {
+		BuyCount = 0;
+		SellCount = 0;
+	}
+	
+	if(Buy[i] AND BuyCount == 0 AND NOT onBuy1){
+		BuyCount = 1;
+		onBuy1 = 1;
+	}
+	else
+		Buy[i] = 0;
+		
+	if(onBuy1 AND Sell[i])
+		onBuy1 = 0;
+		
+	if(Short[i] AND SellCount == 0 AND NOT onShort1){
+		SellCount = 1;
+		onShort1 = 1;
+	}
+	else Short[i] = 0;
+	
+	if(onShort1 AND Cover[i])
+		onShort1 = 0;
+	
+}
+
+
+/*******************************************************
+	Plot the Buy,Sell,Short and Cover signals
+	Plot the trailing stop loss 
+********************************************************/
+/** Plot Buy Arrows */
+PlotShapes(shapeSquare * Buy,colorGreen,0,L,-50,0);
+PlotShapes(shapeSquare * Buy,colorGreen,0,L,-40,0);
+PlotShapes(shapeUpArrow * Buy,colorWhite,0,L,-45,0);
+PlotShapes(shapeDownTriangle * Sell,colorRed,0,H,-20,0);
+/** Plot Sell Arrows */
+PlotShapes(shapeSquare * Short,colorRed,0,H,50,0);
+PlotShapes(shapeSquare * Short,colorRed,0,H,40,0);
+PlotShapes(shapeDownArrow * Short,colorWhite,0,H,-45,0);
+PlotShapes(shapeUpTriangle * Cover,colorGreen,0,L,-20,0);
+/** Plotting the trailing stop loss for long **/
+trailingStopLineLong = IIf(inLongTrade,tslLong,Null);
+Plot(Ref(trailingStopLineLong,-1),"tslLong",colorAqua,styleLine | styleDots,0,0,0,0,3);
+/** Plotting the trailing stop loss for short **/
+trailingStopLineShort = IIf(inShortTrade,tslShort,Null);
+Plot(Ref(trailingStopLineShort,-1),"tslShort",colorYellow,styleLine | styleDots,0,0,0,0,3);
+
+
+_SECTION_END();
+
+_SECTION_BEGIN("Buy/Sell Orders");
+
+/** We cannot use buy and Sell signals to place orders because, it might be triggred anytime during 
+scan interval. So the logic is, Once an IB is formed, we are going to place 2 orders to the top and
+bottom of the IB, So when a market reaches that price level the order will get triggered. 
+We also need to manage to cancel the opposite order and place a stop loss order. The order managment
+seems more tricky. **/ 
+function NewBarJustArrived()
+{
+  vname = "lbe"+GetChartID();
+  prev = Nz( StaticVarGet( vname ) );
+  curr = Status("lastbarend");
+  
+  StaticVarSet( vname, curr );
+  
+  return curr != prev;
+}
+if( NewBarJustArrived() )
+  _TRACE("New bar just arrived (previous is complete)");
+else
+  _TRACE("Old bar");
+  
+if(LastValue(ibday_E,True) == True){
+	if(LastValue(Buy,true) == True){
+		_TRACE("We are in Long position");
+		//_TRACE("Order ID -- ");
+		//_TRACE("Order Type -- ");
+		storeOrder(Random(),"Buy",Name(),100,TimeNum());
+		onBuy = true;	
+	}else if(LastValue(Short,true) == True){
+		_TRACE("We are in Short position");
+		//_TRACE("Order ID -- ");
+		//_TRACE("Order Type -- ");		
+		onShort = true;		
+		storeOrder(Random(),"Sell",Name(),100,TimeNum());
+	}else if(LastValue(Cover,true) == true){
+		onShort = False;
+	}else if(LastValue(Sell,true) == true){
+		onBuy = False;
+	}
+	if(LastValue(onBuy,True) == true){
+		_TRACE(Name() + " Trailing Stop Loss Long" + LastValue(tslLong,True));
+		if(LastValue(tslLong,True) != LastValue(Ref(tslLong,-1),True) ){
+			_TRACE("Sending new trailing stop loss for long to the exchange");
+			_TRACE("Old Trailing SL" + Ref(tslLong,-1));
+			_TRACE("New Trailing SL" + tslLong);
+		}
+	}else if(LastValue(onShort,true) == true){
+		_TRACE(Name() + " Trailing Stop Loss Short  " + LastValue(tslShort,True));
+		if(LastValue(tslShort,True) != LastValue(Ref(tslShort,-1),True)){
+			_TRACE("Sending new trailing stop loss for short to the exchange");
+			_TRACE("Old Trailing SL" + Ref(tslShort,-1));
+			_TRACE("New Trailing SL" + tslShort);
+		}
+	}
+}
+
+_SECTION_END();
+
+PositionRisk = 4/MaxOpenPosition;
+PctSize =  PositionRisk * C / RiskPerShare_E;
+SetPositionSize( PctSize, spsPercentOfEquity );
+
+Filter = ibday_E;
+AddColumn(Buy,"Buy");
+AddColumn(Short,"Short");
+AddColumn(Ref(tslShort,-1),"tslShort");
+AddColumn(Ref(tslLong,-1),"tslLong");
+AddColumn(C,"C");
